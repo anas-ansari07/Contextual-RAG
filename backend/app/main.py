@@ -10,6 +10,8 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
+import traceback
+from app.contextualizer import generate_context
 
 # Loading the .env file
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -42,14 +44,27 @@ embedding_model = SentenceTransformer(
 chroma_client = chromadb.PersistentClient(
     path=str(BASE_DIR / "chroma_db")
 )
-collection = chroma_client.get_or_create_collection(
-    name="contextiq_documents",
+# collection = chroma_client.get_or_create_collection(
+#     name="contextiq_documents",
+#     metadata={"hnsw:space": "cosine"},
+# )
+
+# Baseline index: original chunk embeddings.
+baseline_collection = chroma_client.get_or_create_collection(
+    name="contextiq_baseline",
+    metadata={"hnsw:space": "cosine"},
+)
+
+# Contextual index: embeddings of enriched chunks.
+contextual_collection = chroma_client.get_or_create_collection(
+    name="contextiq_contextual",
     metadata={"hnsw:space": "cosine"},
 )
 
 class AskRequest(BaseModel):
     question: str
     top_k: int = 5
+    retrieval_mode: str = "baseline"
 
 
 # chunk_text() splits each page into overlapping sections. We preserve the page number so citations remain traceable.
@@ -159,8 +174,10 @@ def health():
     return {
         "status": "ok",
         "project": "ContextIQ",
-        "indexed_chunks": collection.count(),
+        "baseline_chunks": baseline_collection.count(),
+        "contextual_chunks": contextual_collection.count(),
     }
+
 
 
 @app.post("/documents/upload")
@@ -168,22 +185,21 @@ async def upload_pdf(file: UploadFile = File(...)):
     if not file.filename or Path(file.filename).suffix.lower() != ".pdf":
         raise HTTPException(
             status_code=400,
-            detail="Please upload a PDF file."
+            detail="Please upload a PDF file.",
         )
 
-    # Keep the first version small and predictable.
     content = await file.read()
 
     if len(content) > 15 * 1024 * 1024:
         raise HTTPException(
             status_code=413,
-            detail="PDF must be 15 MB or smaller."
+            detail="PDF must be 15 MB or smaller.",
         )
 
     if not content.startswith(b"%PDF-"):
         raise HTTPException(
             status_code=400,
-            detail="The uploaded file is not a valid PDF."
+            detail="The uploaded file is not a valid PDF.",
         )
 
     document_id = str(uuid.uuid4())
@@ -191,7 +207,8 @@ async def upload_pdf(file: UploadFile = File(...)):
     safe_path.write_bytes(content)
 
     ids = []
-    documents = []
+    original_chunks = []
+    contextual_chunks = []
     metadatas = []
 
     try:
@@ -199,7 +216,7 @@ async def upload_pdf(file: UploadFile = File(...)):
             if pdf.page_count == 0:
                 raise HTTPException(
                     status_code=400,
-                    detail="The PDF has no pages."
+                    detail="The PDF has no pages.",
                 )
 
             for page_index, page in enumerate(pdf):
@@ -211,56 +228,91 @@ async def upload_pdf(file: UploadFile = File(...)):
                 chunks = chunk_text(page_text)
 
                 for chunk_index, chunk in enumerate(chunks):
-                    ids.append(
-                        f"{document_id}-p{page_index + 1}-c{chunk_index}"
+                    chunk_id = (
+                        f"{document_id}-p{page_index + 1}"
+                        f"-c{chunk_index}"
                     )
-                    documents.append(chunk)
+
+                    # Generate context using the text of the page
+                    # containing this chunk.
+                    context = generate_context(
+                        chunk_text=chunk,
+                        document_context=page_text[:12000],
+                    )
+
+                    # Embed the enriched text, but preserve original
+                    # text separately for citations and evidence.
+                    contextual_text = (
+                        f"Document context: {context}\n\n"
+                        f"Original passage: {chunk}"
+                    )
+
+                    ids.append(chunk_id)
+                    original_chunks.append(chunk)
+                    contextual_chunks.append(contextual_text)
+
                     metadatas.append({
                         "document_id": document_id,
                         "filename": Path(file.filename).name,
                         "page_number": page_index + 1,
                         "chunk_index": chunk_index,
+                        "context": context,
                     })
 
-        if not documents:
+        if not ids:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "No extractable text was found. "
-                    "Scanned PDFs need OCR, which we'll add later."
-                )
+                    "No extractable text found. "
+                    "Scanned PDFs require OCR."
+                ),
             )
 
-        # Batch embeddings instead of making one call per chunk.
-        vectors = embed_texts(documents)
+        # Generate local embeddings in batches.
+        baseline_vectors = embed_texts(original_chunks)
+        contextual_vectors = embed_texts(contextual_chunks)
 
-        collection.add(
+        # Store the baseline and contextual indexes separately.
+        baseline_collection.add(
             ids=ids,
-            documents=documents,
+            documents=original_chunks,
+            metadatas=[
+                {k: v for k, v in m.items() if k != "context"}
+                for m in metadatas
+            ],
+            embeddings=baseline_vectors,
+        )
+
+        contextual_collection.add(
+            ids=ids,
+            documents=contextual_chunks,
             metadatas=metadatas,
-            embeddings=vectors,
+            embeddings=contextual_vectors,
         )
 
         return {
             "document_id": document_id,
             "filename": Path(file.filename).name,
-            "chunks_indexed": len(documents),
-            "pages_processed": len({
-                m["page_number"] for m in metadatas
-            }),
+            "chunks_indexed": len(ids),
             "status": "indexed",
+            "indexes": [
+                "baseline",
+                "contextual",
+            ],
         }
 
     except HTTPException:
         raise
     except Exception as exc:
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
-            detail=f"PDF indexing failed: {str(exc)[:300]}"
+            detail=f"PDF indexing failed: {type(exc).__name__}: {exc}",
         ) from exc
     finally:
-        # ChromaDB retains the extracted text and embeddings.
         safe_path.unlink(missing_ok=True)
+
+
 
 
 @app.post("/chat/ask")
@@ -270,55 +322,82 @@ def ask_question(request: AskRequest):
     if not question:
         raise HTTPException(
             status_code=400,
-            detail="Question cannot be empty."
+            detail="Question cannot be empty.",
         )
 
-    if collection.count() == 0:
+    if request.retrieval_mode not in {"baseline", "contextual"}:
         raise HTTPException(
             status_code=400,
-            detail="Upload a PDF before asking questions."
+            detail="retrieval_mode must be baseline or contextual.",
+        )
+
+    selected_collection = (
+        contextual_collection
+        if request.retrieval_mode == "contextual"
+        else baseline_collection
+    )
+
+    if selected_collection.count() == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload a PDF to the selected index first.",
         )
 
     top_k = max(1, min(request.top_k, 10))
     query_vector = embed_texts([question])[0]
 
-    results = collection.query(
+    results = selected_collection.query(
         query_embeddings=[query_vector],
-        n_results=min(top_k, collection.count()),
+        n_results=min(top_k, selected_collection.count()),
         include=["documents", "metadatas", "distances"],
     )
 
     evidence_parts = []
     sources = []
 
-    for index, text in enumerate(results["documents"][0]):
+    for index, retrieved_text in enumerate(results["documents"][0]):
         metadata = results["metadatas"][0][index]
         distance = results["distances"][0][index]
 
         source_id = f"S{index + 1}"
+
+        # The contextual index stores enriched text.
+        # Strip it from the displayed evidence by retaining the
+        # original passage separately in metadata in the next
+        # refinement. For now, use the original baseline record
+        # with the same chunk ID.
+        if request.retrieval_mode == "contextual":
+            original_result = baseline_collection.get(
+                ids=[results["ids"][0][index]],
+                include=["documents"],
+            )
+            original_text = original_result["documents"][0]
+        else:
+            original_text = retrieved_text
+
         sources.append({
             "source_id": source_id,
             "filename": metadata["filename"],
             "page_number": metadata["page_number"],
             "chunk_index": metadata["chunk_index"],
             "distance": round(float(distance), 4),
-            "text": text,
+            "text": original_text,
         })
 
         evidence_parts.append(
             f"[{source_id} | {metadata['filename']} | "
-            f"page {metadata['page_number']}]\n{text}"
+            f"page {metadata['page_number']}]\n{original_text}"
         )
 
     answer = call_openrouter(
         question,
-        "\n\n".join(evidence_parts)
+        "\n\n".join(evidence_parts),
     )
 
     return {
         "question": question,
         "answer": answer,
         "sources": sources,
-        "retrieval_mode": "baseline_vector",
-        "model": os.getenv("OPENROUTER_MODEL", "openrouter/free"),
+        "retrieval_mode": request.retrieval_mode,
+        "model": os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free"),
     }

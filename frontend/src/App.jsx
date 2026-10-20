@@ -10,6 +10,7 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [retrievalMode, setRetrievalMode] = useState("baseline");
 
   async function uploadDocument() {
     if (!file) return;
@@ -52,7 +53,7 @@ export default function App() {
       const response = await fetch(`${API}/chat/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, top_k: 5 }),
+        body: JSON.stringify({ question, top_k: 5, retrievalMode: retrievalMode }),
       });
 
       const data = await response.json();
@@ -93,8 +94,8 @@ export default function App() {
 
         {documentInfo && (
           <p className="success">
-            Indexed {documentInfo.filename}:{" "}
-            {documentInfo.chunks_indexed} chunks
+            Indexed {documentInfo.filename}: {documentInfo.chunks_indexed}{" "}
+            chunks
           </p>
         )}
       </section>
@@ -102,15 +103,23 @@ export default function App() {
       <section className="panel">
         <h2>2. Ask your document</h2>
         <form onSubmit={askQuestion}>
+          <label>
+            Retrieval mode
+            <select
+              value={retrievalMode}
+              onChange={(event) => setRetrievalMode(event.target.value)}
+            >
+              <option value="baseline">Baseline RAG</option>
+              <option value="contextual">Contextual RAG</option>
+            </select>
+          </label>
           <textarea
             value={question}
             onChange={(event) => setQuestion(event.target.value)}
             placeholder="Ask a question about your uploaded PDF..."
             rows={3}
           />
-          <button disabled={busy || !question.trim()}>
-            Ask ContextIQ
-          </button>
+          <button disabled={busy || !question.trim()}>Ask ContextIQ</button>
         </form>
       </section>
 
@@ -126,12 +135,11 @@ export default function App() {
             <article className="source" key={source.source_id}>
               <strong>
                 [{source.source_id}] {source.filename}
-                {" — Page "}{source.page_number}
+                {" — Page "}
+                {source.page_number}
               </strong>
               <p>{source.text}</p>
-              <small>
-                Retrieval distance: {source.distance}
-              </small>
+              <small>Retrieval distance: {source.distance}</small>
             </article>
           ))}
         </section>

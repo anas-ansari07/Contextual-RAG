@@ -1,0 +1,114 @@
+
+:root {
+  font-family: Inter, system-ui, sans-serif;
+  color: #e8edf7;
+  background: #0b1020;
+  font-synthesis: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+button, input, textarea {
+  font: inherit;
+}
+
+.app {
+  width: min(850px, 92%);
+  margin: 0 auto;
+  padding: 48px 0;
+}
+
+header {
+  margin-bottom: 32px;
+}
+
+.eyebrow {
+  color: #8b9cff;
+  font-size: 12px;
+  letter-spacing: 2px;
+}
+
+h1 {
+  font-size: clamp(38px, 7vw, 60px);
+  margin: 8px 0;
+}
+
+header p, small {
+  color: #a5b1c7;
+}
+
+.panel {
+  background: #141c30;
+  border: 1px solid #293650;
+  border-radius: 16px;
+  padding: 24px;
+  margin: 18px 0;
+}
+
+input[type="file"], textarea {
+  display: block;
+  width: 100%;
+  margin: 16px 0;
+}
+
+textarea, input[type="file"] {
+  color: inherit;
+}
+
+textarea {
+  background: #0b1020;
+  border: 1px solid #35425d;
+  border-radius: 10px;
+  padding: 14px;
+  resize: vertical;
+}
+
+button {
+  background: #788bff;
+  color: #0b1020;
+  border: 0;
+  border-radius: 9px;
+  padding: 12px 18px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.success {
+  color: #6ee7b7;
+}
+
+.error {
+  color: #fca5a5;
+  padding: 12px;
+}
+
+.answer {
+  white-space: pre-wrap;
+  line-height: 1.8;
+}
+
+.source {
+  background: #0b1020;
+  border: 1px solid #293650;
+  border-radius: 10px;
+  padding: 16px;
+  margin-top: 12px;
+  overflow-wrap: anywhere;
+}
+
+.source p {
+  line-height: 1.7;
+  color: #c5cee0;
+}

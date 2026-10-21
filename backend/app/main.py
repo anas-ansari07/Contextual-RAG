@@ -12,6 +12,8 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import traceback
 from app.contextualizer import generate_context
+import re
+from rank_bm25 import BM25Okapi
 
 # Loading the .env file
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -314,6 +316,74 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 
 
+def tokenize_text(text: str) -> list[str]:
+    """Tokenize text for keyword-based retrieval."""
+    return re.findall(r"\b[\w.-]+\b", text.lower())
+
+
+def get_bm25_ranked_ids(question: str, top_n: int = 15) -> list[str]:
+    """
+    Rank original PDF chunks using BM25 keyword search.
+    """
+    corpus = baseline_collection.get(
+        include=["documents", "metadatas"]
+    )
+
+    documents = corpus.get("documents") or []
+    document_ids = corpus.get("ids") or []
+
+    if not documents:
+        return []
+
+    tokenized_documents = [
+        tokenize_text(document or "")
+        for document in documents
+    ]
+
+    bm25 = BM25Okapi(tokenized_documents)
+    query_tokens = tokenize_text(question)
+
+    if not query_tokens:
+        return []
+
+    scores = bm25.get_scores(query_tokens)
+
+    ranked_indices = sorted(
+        range(len(scores)),
+        key=lambda index: scores[index],
+        reverse=True,
+    )
+
+    return [
+        document_ids[index]
+        for index in ranked_indices[:top_n]
+        if scores[index] > 0
+    ]
+
+
+def reciprocal_rank_fusion(
+    ranked_lists: list[list[str]],
+    k: int = 60,
+) -> list[str]:
+    """
+    Combine ranked result lists using Reciprocal Rank Fusion.
+    """
+    fused_scores = {}
+
+    for ranked_list in ranked_lists:
+        for rank, document_id in enumerate(ranked_list, start=1):
+            fused_scores[document_id] = (
+                fused_scores.get(document_id, 0)
+                + 1 / (k + rank)
+            )
+
+    return sorted(
+        fused_scores,
+        key=fused_scores.get,
+        reverse=True,
+    )
+
+
 
 @app.post("/chat/ask")
 def ask_question(request: AskRequest):
@@ -325,79 +395,160 @@ def ask_question(request: AskRequest):
             detail="Question cannot be empty.",
         )
 
-    if request.retrieval_mode not in {"baseline", "contextual"}:
+    mode = request.retrieval_mode.lower()
+
+    if mode not in {"baseline", "contextual", "hybrid"}:
         raise HTTPException(
             status_code=400,
-            detail="retrieval_mode must be baseline or contextual.",
-        )
-
-    selected_collection = (
-        contextual_collection
-        if request.retrieval_mode == "contextual"
-        else baseline_collection
-    )
-
-    if selected_collection.count() == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Upload a PDF to the selected index first.",
+            detail="retrieval_mode must be baseline, contextual, or hybrid.",
         )
 
     top_k = max(1, min(request.top_k, 10))
-    query_vector = embed_texts([question])[0]
 
-    results = selected_collection.query(
-        query_embeddings=[query_vector],
-        n_results=min(top_k, selected_collection.count()),
-        include=["documents", "metadatas", "distances"],
+    # Create the query embedding locally.
+    query_embedding = embedding_model.encode(
+        question,
+        normalize_embeddings=True,
+    ).tolist()
+
+    # Baseline uses original passages.
+    # Contextual uses enriched passages for semantic search.
+    semantic_collection = (
+        contextual_collection if mode == "contextual"
+        else baseline_collection
     )
 
-    evidence_parts = []
-    sources = []
+    semantic_results = semantic_collection.query(
+        query_embeddings=[query_embedding],
+        n_results=min(
+            max(top_k * 3, 15),
+            semantic_collection.count(),
+        ),
+        include=["documents", "metadatas"],
+    )
 
-    for index, retrieved_text in enumerate(results["documents"][0]):
-        metadata = results["metadatas"][0][index]
-        distance = results["distances"][0][index]
+    semantic_ids = (
+        semantic_results.get("ids") or [[]]
+    )[0]
 
-        source_id = f"S{index + 1}"
-
-        # The contextual index stores enriched text.
-        # Strip it from the displayed evidence by retaining the
-        # original passage separately in metadata in the next
-        # refinement. For now, use the original baseline record
-        # with the same chunk ID.
-        if request.retrieval_mode == "contextual":
-            original_result = baseline_collection.get(
-                ids=[results["ids"][0][index]],
-                include=["documents"],
-            )
-            original_text = original_result["documents"][0]
-        else:
-            original_text = retrieved_text
-
-        sources.append({
-            "source_id": source_id,
-            "filename": metadata["filename"],
-            "page_number": metadata["page_number"],
-            "chunk_index": metadata["chunk_index"],
-            "distance": round(float(distance), 4),
-            "text": original_text,
-        })
-
-        evidence_parts.append(
-            f"[{source_id} | {metadata['filename']} | "
-            f"page {metadata['page_number']}]\n{original_text}"
+    if mode == "hybrid":
+        # Combine semantic ranking with BM25 keyword ranking.
+        keyword_ids = get_bm25_ranked_ids(
+            question,
+            top_n=max(top_k * 3, 15),
         )
 
-    answer = call_openrouter(
-        question,
-        "\n\n".join(evidence_parts),
+        ranked_ids = reciprocal_rank_fusion(
+            [semantic_ids, keyword_ids]
+        )[:top_k]
+
+        # Fetch original text so generated context isn't presented
+        # as source evidence.
+        source_data = baseline_collection.get(
+            ids=ranked_ids,
+            include=["documents", "metadatas"],
+        )
+
+        source_lookup = {
+            doc_id: {
+                "text": document,
+                "metadata": metadata or {},
+            }
+            for doc_id, document, metadata in zip(
+                source_data.get("ids") or [],
+                source_data.get("documents") or [],
+                source_data.get("metadatas") or [],
+            )
+        }
+
+        sources = [
+            {
+                "text": source_lookup[doc_id]["text"],
+                "filename": source_lookup[doc_id]["metadata"].get(
+                    "filename", "Unknown"
+                ),
+                "page_number": source_lookup[doc_id]["metadata"].get(
+                    "page_number"
+                ),
+                "chunk_index": source_lookup[doc_id]["metadata"].get(
+                    "chunk_index"
+                ),
+            }
+            for doc_id in ranked_ids
+            if doc_id in source_lookup
+        ]
+
+    else:
+        # Preserve the existing baseline/contextual behavior.
+        result_ids = (
+            semantic_results.get("ids") or [[]]
+        )[0][:top_k]
+
+        result_documents = (
+            semantic_results.get("documents") or [[]]
+        )[0][:top_k]
+
+        result_metadatas = (
+            semantic_results.get("metadatas") or [[]]
+        )[0][:top_k]
+
+        sources = []
+
+        for doc_id, document, metadata in zip(
+            result_ids,
+            result_documents,
+            result_metadatas,
+        ):
+            metadata = metadata or {}
+
+            if mode == "contextual":
+                # Retrieve the original passage by its shared ID.
+                original = baseline_collection.get(
+                    ids=[doc_id],
+                    include=["documents", "metadatas"],
+                )
+
+                original_documents = original.get("documents") or []
+                original_metadatas = original.get("metadatas") or []
+
+                if original_documents:
+                    document = original_documents[0]
+                    metadata = (
+                        original_metadatas[0]
+                        if original_metadatas else metadata
+                    ) or metadata
+
+            sources.append(
+                {
+                    "text": document,
+                    "filename": metadata.get("filename", "Unknown"),
+                    "page_number": metadata.get("page_number"),
+                    "chunk_index": metadata.get("chunk_index"),
+                }
+            )
+
+    if not sources:
+        return {
+            "answer": "I couldn't find relevant information in the indexed documents.",
+            "sources": [],
+        }
+
+    context = "\n\n".join(
+        (
+            f"Source {index}: {source['filename']}, "
+            f"page {source['page_number']}\n"
+            f"{source['text']}"
+        )
+        for index, source in enumerate(sources, start=1)
     )
 
+    answer = call_openrouter(
+    question=question,
+    evidence=context,
+)
+
     return {
-        "question": question,
         "answer": answer,
         "sources": sources,
-        "retrieval_mode": request.retrieval_mode,
-        "model": os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free"),
+        "retrieval_mode": mode,
     }
